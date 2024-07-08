@@ -11,6 +11,10 @@ import keras
 from keras import backend as K
 from skimage.morphology import skeletonize
 import datetime
+import math
+from typing import List, Tuple
+import torch
+import torch.nn as nn
 
 # Global parameters and functions
 
@@ -38,17 +42,17 @@ def dice_coef_loss(y_true, y_pred):
 custom_objects = {"dice_coef_loss": dice_coef_loss, 'iou_score': iou_score}
 
 with keras.saving.custom_object_scope(custom_objects):
-    model = load_model("models/r2u_attention_80e.h5")
+    vessel_model = load_model("models/r2u_attention_80e.h5")
     
 with keras.saving.custom_object_scope(custom_objects):
     catheter_model = load_model("models/catheter_detect.h5")
 
-def predict_one_image(img, model):
+def predict_one_image(img, vessel_model):
     resized_img = cv2.resize(img, (512, 512))
     X = np.reshape(resized_img, (1, resized_img.shape[0], resized_img.shape[1], 1))
     normalized_X = X/255
     normalized_X = np.rollaxis(normalized_X, 3, 1)
-    pred_y = model.predict(normalized_X, verbose=0)
+    pred_y = vessel_model.predict(normalized_X, verbose=0)
     pred_y[pred_y > 0.5] = 1
     pred_y[pred_y != 1] = 0
     pred_img = np.reshape(pred_y[0]*255, (512, 512))
@@ -67,7 +71,7 @@ def find_largest_contour(contours):
 
 def remove_catheter(image):
     orginial_image = image.copy()
-    vessel_img, _ = predict_one_image(image, model)
+    vessel_img, _ = predict_one_image(image, vessel_model)
     catheter_img, _ = predict_one_image(image, catheter_model)
     subtract_image = vessel_img - catheter_img
     _, binary = cv2.threshold(subtract_image, 50, 255, cv2.THRESH_BINARY)
@@ -137,7 +141,99 @@ def vectorize_one_image_using_center_line(img):
 
     return vector, img_with_rectangles, centerline_with_rect
 
-# Convert coordinations from bigger images to 512 x 512 images
+## Sort vectors
+def most_left_upper_point(points: List[Tuple[float, float]]) -> Tuple[float, float, float]:
+    most_left_upper = points[0]
+
+    for point in points[1:]:
+        if point[0]==0 and point[1]==0:
+            continue
+        if point[0] < most_left_upper[0] or (point[0] == most_left_upper[0] and point[1] < most_left_upper[1]):
+            most_left_upper = point
+
+    return most_left_upper
+
+def calculate_angle(point1, point2, point3):
+    vector1 = (point1[0] - point2[0], point1[1] - point2[1])
+    vector2 = (point3[0] - point2[0], point3[1] - point2[1])
+    dot_product = vector1[0] * vector2[0] + vector1[1] * vector2[1]
+    
+    magnitude1 = math.sqrt(vector1[0]**2 + vector1[1]**2)
+    magnitude2 = math.sqrt(vector2[0]**2 + vector2[1]**2)
+    
+    cosine_theta = dot_product / (magnitude1 * magnitude2)
+    cosine_theta = max(-1, min(1, cosine_theta))
+    theta_rad = math.acos(cosine_theta)
+    
+    theta_deg = math.degrees(theta_rad)
+    
+    return theta_deg
+
+def vector_distance(point1: Tuple[float, float], point2: Tuple[float, float]) -> float:
+        x1, y1 = point1
+        x2, y2 = point2
+        return ((x1 - x2) ** 2 + (y1 - y2) ** 2) ** 0.5
+    
+def calculate_ratio(previous_point: Tuple[float, float], current_point: Tuple[float, float], next_point: Tuple[float, float], image) -> float:
+    overlap = get_overlap(current_point, next_point, 20, image)
+    angle = calculate_angle(previous_point, current_point, next_point)
+    return 0.5*overlap + 0.5*angle
+
+def dfs(current_point: Tuple[float, float, float], remaining_points: List[Tuple[float, float, float]], path: List[Tuple[float, float, float]], queue: List[Tuple[float, float, float]], reset_branch: Tuple[float, float], previous_point: Tuple[float, float], image) -> List[Tuple[float, float, float]]:
+    if not (reset_branch[0]!=0 and reset_branch[1]!=0) or len(path)==0:
+        path.append(current_point)
+    if not remaining_points:
+        return path
+    
+    remaining_points.sort(key=lambda point: vector_distance((point[0], point[1]), (current_point[0], current_point[1])))
+
+    branches = []
+    for chosen_point in remaining_points[:10]:    
+        distance = vector_distance((chosen_point[0], chosen_point[1]), (current_point[0], current_point[1]))
+        if not (reset_branch[0]!=0 and reset_branch[1]!=0) and (previous_point[0]!=0 and previous_point[1]!=0):
+            point1 = previous_point[:2]
+            point2 = current_point[:2]
+            angle = calculate_angle(point1, point2, chosen_point)
+        else:
+            angle = -1
+        if distance < 30:
+            branches.append(chosen_point)
+    
+    if len(branches)>1:
+        for time_appeared in branches[0:]:
+            queue.append(current_point)
+        
+        if not (reset_branch[0]!=0 and reset_branch[1]!=0) and (previous_point[0]!=0 and previous_point[1]!=0):
+            branches.sort(key=lambda point: calculate_ratio(previous_point, current_point, point, image), reverse=True)
+        else:
+            branches.sort(key=lambda point: get_overlap(point, current_point, 20, image), reverse=True)
+
+    if len(branches)>0:
+        previous_point = current_point
+        next_point = branches[0]
+        reset_branch = [0, 0]
+        remove_index = next(i for i, point in enumerate(remaining_points) if np.array_equal(point, next_point))
+        remaining_points.pop(remove_index)
+    else:
+        if len(queue)>0:
+            next_point = queue.pop(0)
+            reset_branch = next_point[:2]
+            previous_point = [0,0]
+        else:
+            next_point = remaining_points.pop(0)
+            reset_branch = [0, 0]
+            previous_point = [0,0]
+        
+    return dfs(next_point, remaining_points, path, queue, reset_branch, previous_point, image) 
+
+def sort_by_distance(points: List[Tuple[float, float, float]], image) -> List[Tuple[float, float, float]]:
+    initial_point = most_left_upper_point(points)    
+    points = [point for point in points if not np.array_equal(point, initial_point)]
+
+    sorted_points = dfs(initial_point, points, [], [], initial_point, [0,0], image)
+    return sorted_points
+
+## Convert coordinations from bigger images to 512 x 512 images
 def adjust_boxes(row):
     width_scale = 512 / row['width']
     height_scale = 512 / row['height']
@@ -149,7 +245,32 @@ def adjust_boxes(row):
 
     return row
 
-def is_window_overlap(x, y, window_size, box):
+def get_overlap(point1, point2, window_size, image):
+    x1_min, y1_min = int(point1[0] - window_size//2), int(point1[1] - window_size//2)
+    x1_max, y1_max = int(point1[0] + window_size//2), int(point1[1] + window_size//2)
+    
+    x2_min, y2_min = int(point2[0] - window_size//2), int(point2[1] - window_size//2)
+    x2_max, y2_max = int(point2[0] + window_size//2), int(point2[1] + window_size//2)
+    
+    overlap_x_min = max(x1_min, x2_min)
+    overlap_x_max = min(x1_max, x2_max)
+    overlap_y_min = max(y1_min, y2_min)
+    overlap_y_max = min(y1_max, y2_max)
+    
+    if overlap_x_min >= overlap_x_max or overlap_y_min >= overlap_y_max:
+        return 0
+    
+    overlap_region = np.zeros((overlap_y_max - overlap_y_min, overlap_x_max - overlap_x_min))
+    
+    overlap_region1 = image[overlap_y_min:overlap_y_max, overlap_x_min:overlap_x_max]
+    overlap_region2 = image[overlap_y_min:overlap_y_max, overlap_x_min:overlap_x_max]
+    
+    non_zero_count = np.count_nonzero(overlap_region1) + np.count_nonzero(overlap_region2)
+    
+    return non_zero_count
+
+
+def calculate_overlap_percentage(x, y, window_size, box):
     xmin = x - window_size / 2
     ymin = y - window_size / 2
     xmax = x + window_size / 2
@@ -157,13 +278,20 @@ def is_window_overlap(x, y, window_size, box):
 
     box_xmin, box_ymin, box_xmax, box_ymax = box
 
-    if (xmin < box_xmax and xmax > box_xmin and
-        ymin < box_ymax and ymax > box_ymin):
-        return 1
-    else:
-        return 0
+    inter_xmin = max(xmin, box_xmin)
+    inter_ymin = max(ymin, box_ymin)
+    inter_xmax = min(xmax, box_xmax)
+    inter_ymax = min(ymax, box_ymax)
 
-# ViT
+    inter_area = max(0, inter_xmax - inter_xmin) * max(0, inter_ymax - inter_ymin)
+
+    window_area = window_size * window_size
+
+    overlap_percentage = (inter_area / window_area) * 100
+
+    return overlap_percentage
+
+## ViT
 
 def smooth_labels(labels, factor=0.1):
     labels = tf.convert_to_tensor(labels, dtype=tf.float32)
@@ -219,10 +347,10 @@ def create_vit_classifier(input_shape, num_classes=MAX_VECTORS):
 
     features = mlp(representation, hidden_units=mlp_head_units, dropout_rate=0.5)
     logits = layers.Dense(num_classes, activation="sigmoid")(features)
-    model = keras.Model(inputs=encoded_patches, outputs=logits)
-    return model
+    stenosis_model = keras.Model(inputs=encoded_patches, outputs=logits)
+    return stenosis_model
 
-# Metrics
+## Metrics
 def multi_label_accuracy(y_true, y_pred):
     y_pred = tf.round(y_pred)
     y_true = tf.round(y_true)
@@ -231,12 +359,14 @@ def multi_label_accuracy(y_true, y_pred):
     accuracy = correct_predictions / predictions
     return tf.reduce_mean(accuracy)
 
+nINF = -100
+
 class TwoWayLoss(tf.keras.losses.Loss):
     def __init__(self, Tp=4.0, Tn=1.0, name="two_way_loss"):
         super().__init__(name=name)
         self.Tp = Tp
         self.Tn = Tn
-        self.nINF = -1000.0  
+        self.nINF = -100.0  
 
     def call(self, y_true, y_pred):
         y_true = tf.convert_to_tensor(y_true)
@@ -262,9 +392,10 @@ class TwoWayLoss(tf.keras.losses.Loss):
         return loss
 
 def get_criterion():
-    return TwoWayLoss(Tp=4.0, Tn=1.0)
+    return TwoWayLoss(Tp=1.0, Tn=1.0)
 
 if __name__ == '__main__':
+    ## Training phase
     df_train = pd.read_csv('train_labels.csv')
     df_train = df_train.apply(adjust_boxes, axis=1)
     filenames = df_train.filename.values
@@ -276,42 +407,41 @@ if __name__ == '__main__':
     boxes = df_train[['xmin', 'ymin', 'xmax', 'ymax']].values
 
 
-    for index, filename in tqdm(enumerate(filenames)):
-        img = cv2.imread(os.path.join("data", filename), 0)
-        resized_img = cv2.resize(img, (512, 512))
-        pred_img, match_img = remove_catheter(img)
-        skeletion = skeletonize(pred_img.astype(int))
-        vector, img_with_rectangles, centerline_with_rect = vectorize_one_image_using_center_line(img)
-        label = []
-        for v in vector:
-            x, y, color = v
-            label.append(is_window_overlap(x, y, WINDOW_SIZE//2, boxes[index]))
-        vectors[index] = vector
-        label = np.array(label)
-        labels[index] = label
-    np.save("processed_data/label.npy", labels)
-    np.save("processed_data/vector.npy", vectors)
+    # for index, filename in tqdm(enumerate(filenames)):
+    #     img = cv2.imread(os.path.join("data", filename), 0)
+    #     pred_img, match_img = remove_catheter(img)
+    #     vector, img_with_rectangles, centerline_with_rect = vectorize_one_image_using_center_line(img)
+    #     vector = sort_by_distance(vector, pred_img)
+    #     label = np.zeros((MAX_VECTORS))
+    #     filtered_vector = np.zeros((MAX_VECTORS, 3))
+    #     images = np.zeros((MAX_VECTORS, WINDOW_SIZE, WINDOW_SIZE))
+    #     count = 0
 
-    for index, filename in tqdm(enumerate(filenames)):
-        img = cv2.imread(os.path.join("data", filename), 0)
-        resized_img = cv2.resize(img, (512, 512))
-        pred_img, match_img = remove_catheter(img)
-        vector = vectors[index]
-        images = np.zeros((MAX_VECTORS, WINDOW_SIZE, WINDOW_SIZE))
-        for i, v in enumerate(vector):
-            x, y, pixel_count = v
-            x = int(x)
-            y = int(y)
-            xmin = x-WINDOW_SIZE//2
-            xmax = x+WINDOW_SIZE//2
-            ymin = y-WINDOW_SIZE//2
-            ymax = y+WINDOW_SIZE//2
-            small_image = pred_img[ymin:ymax, xmin:xmax]
-            images[i] = small_image
-        images_list[index] = images
-    np.save("processed_data/images_list.npy", images_list)
+    #     for v in vector:
+    #         x, y, pixel_count = v
+    #         x = int(x)
+    #         y = int(y)
+    #         xmin = x-WINDOW_SIZE//2
+    #         xmax = x+WINDOW_SIZE//2
+    #         ymin = y-WINDOW_SIZE//2
+    #         ymax = y+WINDOW_SIZE//2
+    #         small_image = match_img[ymin:ymax, xmin:xmax]
+    #         if small_image.shape[0]==20 and small_image.shape[1]==20:
+    #             filtered_vector[count] = v
+    #             images[count] = small_image
+    #             label[count] = int(calculate_overlap_percentage(x, y, WINDOW_SIZE//2, boxes[index])>=50)
+    #             count+=1
 
-    # Remove images cannot extract vessels
+    #     vectors[index] = filtered_vector
+    #     labels[index] = label
+    #     images_list[index] = images
+    # np.save("processed_data/label.npy", labels)
+    # np.save("processed_data/vector.npy", vectors)
+    # np.save("processed_data/images_list.npy", images_list)
+
+    
+
+    ### Remove images cannot extract vessels
     chosen_index = []
     labels = np.load("processed_data/label.npy")
     vectors = np.load("processed_data/vector.npy")
@@ -323,12 +453,13 @@ if __name__ == '__main__':
     labels = labels[chosen_index]
     images_list = np.load("processed_data/images_list.npy")
     images_list = images_list[chosen_index]
+    print("N = ", len(images_list))
 
 
-    # Model config
+    ### Model config
     learning_rate = 1e-4
-    weight_decay = 1e-4
-    batch_size = 2**6
+    weight_decay = 0.1
+    batch_size = 2**5
     num_epochs = 50
     patch_size = WINDOW_SIZE
     num_patches = MAX_VECTORS
@@ -353,41 +484,31 @@ if __name__ == '__main__':
     encoder = PatchEncoder(num_patches=num_patches, projection_dim=projection_dim)
     encoder_model = tf.keras.Sequential([encoder])
     encoder_model.save('patch_encoder.keras')
+    # encoder_model.load_weights('patch_encoder.keras')
     encoded_patches = encoder_model(patches)
     print(encoded_patches.shape)
 
 
 
-    labels = smooth_labels(labels)
+    # labels = smooth_labels(labels)
 
     train_size = len(images_list)
-    initial_learning_rate = 0.001
-    final_learning_rate = 0.00001
-    learning_rate_decay_factor = (final_learning_rate / initial_learning_rate) ** (1 / num_epochs)
-    steps_per_epoch = int(train_size/batch_size)
     transformer_units = [
         projection_dim * 2,
         projection_dim
     ]
 
-    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
-                    initial_learning_rate=initial_learning_rate,
-                    decay_steps=steps_per_epoch,
-                    decay_rate=learning_rate_decay_factor,
-                    staircase=True)
-
-    optimizer = keras.optimizers.Adam(
-        learning_rate=lr_schedule
+    optimizer = keras.optimizers.AdamW(
+        learning_rate=learning_rate, weight_decay=weight_decay
     )
 
     input_shape = (MAX_VECTORS, projection_dim)
-    model = create_vit_classifier(input_shape, MAX_VECTORS)
-    model.compile(
+    stenosis_model = create_vit_classifier(input_shape, MAX_VECTORS)
+    stenosis_model.compile(
         optimizer=optimizer,
         loss=get_criterion(),
         metrics=[
             multi_label_accuracy,
-
         ],
     )
 
@@ -407,7 +528,7 @@ if __name__ == '__main__':
         verbose=1
     )
 
-    history = model.fit(
+    history = stenosis_model.fit(
         encoded_patches,
         labels,
         batch_size=batch_size,
@@ -416,4 +537,70 @@ if __name__ == '__main__':
                 f1_early_stopping_callback],
     )
 
-    model.save("stenosis_detection.keras")
+    stenosis_model.save("stenosis_detection.keras")
+    # stenosis_model.load_weights("stenosis_detection.keras")
+
+
+    ## Test phase
+
+    df_test = pd.read_csv('test_labels.csv')
+    df_test = df_test.apply(adjust_boxes, axis=1)
+    filenames = df_test.filename.values
+    images_list = np.zeros((len(filenames), MAX_VECTORS, WINDOW_SIZE, WINDOW_SIZE))
+
+    vectors = np.zeros((len(filenames), MAX_VECTORS, 3))
+    labels = np.zeros((len(filenames), MAX_VECTORS))
+    boxes = df_test[['xmin', 'ymin', 'xmax', 'ymax']].values
+
+
+    # for index, filename in tqdm(enumerate(filenames)):
+    #     img = cv2.imread(os.path.join("data", filename), 0)
+    #     pred_img, match_img = remove_catheter(img)
+    #     vector, img_with_rectangles, centerline_with_rect = vectorize_one_image_using_center_line(img)
+    #     vector = sort_by_distance(vector, pred_img)
+    #     label = np.zeros((MAX_VECTORS))
+    #     filtered_vector = np.zeros((MAX_VECTORS, 3))
+    #     images = np.zeros((MAX_VECTORS, WINDOW_SIZE, WINDOW_SIZE))
+    #     count = 0
+
+    #     for v in vector:
+    #         x, y, pixel_count = v
+    #         x = int(x)
+    #         y = int(y)
+    #         xmin = x-WINDOW_SIZE//2
+    #         xmax = x+WINDOW_SIZE//2
+    #         ymin = y-WINDOW_SIZE//2
+    #         ymax = y+WINDOW_SIZE//2
+    #         small_image = pred_img[ymin:ymax, xmin:xmax]
+    #         if small_image.shape[0]==20 and small_image.shape[1]==20:
+    #             filtered_vector[count] = v
+    #             images[count] = small_image
+    #             label[count] = int(calculate_overlap_percentage(x, y, WINDOW_SIZE//2, boxes[index])>=50)
+    #             count+=1
+
+    #     vectors[index] = filtered_vector
+    #     labels[index] = label
+    #     images_list[index] = images
+    # np.save("processed_data/test_label.npy", labels)
+    # np.save("processed_data/test_vector.npy", vectors)
+    # np.save("processed_data/test_images_list.npy", images_list)
+
+    ### Remove images cannot extract vessels
+    chosen_index = []
+    labels = np.load("processed_data/test_label.npy")
+    vectors = np.load("processed_data/test_vector.npy")
+    for index, label in enumerate(labels):
+        check = len(np.where(label==1)[0])
+        if check>1:
+            chosen_index.append(index)
+    vectors = vectors[chosen_index]
+    labels = labels[chosen_index]
+    images_list = np.load("processed_data/test_images_list.npy")
+    images_list = images_list[chosen_index]
+
+    patches = images_list
+    channels = 1
+    patches = tf.reshape(patches, (len(images_list), num_patches, patch_size * patch_size * channels))
+    encoded_patches = encoder_model(patches)
+    pred = stenosis_model.predict(encoded_patches, verbose=0)
+    print(multi_label_accuracy(labels, pred))
