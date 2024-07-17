@@ -23,7 +23,24 @@ IMAGE_HEIGHT = 512
 IMAGE_WIDTH = 512
 MAX_VECTORS = 80
 
+def crop_vessel_area(pred_img, match_img, catheter_img):
+    width, height = np.where(pred_img!=0)
+    if len(width)==0 or len(height)==0:
+        return pred_img, match_img, catheter_img
+    max_width = np.max(width)
+    max_height = np.max(height)
+    min_width = np.min(width)
+    min_height = np.min(height)
+    return pred_img[min_width:max_width, min_height:max_height], match_img[min_width:max_width, min_height:max_height], catheter_img[min_width:max_width, min_height:max_height]
 
+def find_catheter_last_point(pred_img):
+    width, height = np.where(pred_img!=0)
+    if len(width)==0 or len(height)==0:
+        return 0, 0
+    max_width = np.max(width)
+    max_height = np.max(height)
+    return max_height, max_width
+    
 def iou_score(y_pred, y_true, smooth=1):
     intersection = K.sum(K.abs(y_true * y_pred), axis=-1)
     union = K.sum(y_true, -1) + K.sum(y_pred, -1) - intersection
@@ -71,6 +88,10 @@ def find_largest_contour(contours):
 
 def remove_catheter(image):
     orginial_image = image.copy()
+#     removed_text_img = remove_text(image, 200, 5)
+#     enhanced_img = final_image_enhance(removed_text_img, 15)
+#     vessel_img, _ = predict_one_image(enhanced_img, vessel_model)
+#     catheter_img, _ = predict_one_image(enhanced_img, catheter_model)
     vessel_img, _ = predict_one_image(image, vessel_model)
     catheter_img, _ = predict_one_image(image, catheter_model)
     subtract_image = vessel_img - catheter_img
@@ -83,7 +104,10 @@ def remove_catheter(image):
         cv2.drawContours(mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
         vessel_img = cv2.bitwise_and(subtract_image, subtract_image, mask=mask)
     resized_img = cv2.resize(orginial_image , (512, 512))    
-    return vessel_img/255., resized_img*vessel_img/255.
+    pred_img = vessel_img/255.
+    match_img = resized_img*pred_img
+    pred_img, match_img, catheter_img = crop_vessel_area(pred_img, match_img, catheter_img)
+    return pred_img, match_img, catheter_img
 
 def distance(x1,y1,x2,y2):
     return np.sqrt((x1-x2)**2 + (y1-y2)**2)
@@ -95,22 +119,22 @@ def min_distance(x,y, vector, limit):
         return d[0]
     return 1000
 
-def vectorize_one_image_using_center_line(img):
+def vectorize_one_image_using_center_line(img):    
     vector = np.zeros((MAX_VECTORS, 3), dtype=np.float32)
     STEP = 5
-    pred_img, match_img = remove_catheter(img)
+    pred_img, match_img, catheter_img = remove_catheter(img)
 
     centerline = skeletonize(pred_img.astype(int))
 
     if np.all(pred_img == 0):
         return vector, None, None
 
-    img_with_rectangles = cv2.cvtColor(match_img, cv2.COLOR_GRAY2BGR)
+    img_with_rectangles = match_img.copy()
     centerline_with_rect = cv2.cvtColor(centerline.astype(np.float32) * 255, cv2.COLOR_GRAY2BGR)
     index = 0
     WS12 = WINDOW_SIZE // 2
     IMAGE_DIM = (IMAGE_HEIGHT, IMAGE_WIDTH)
-
+    
     for y in range(0, IMAGE_DIM[0], STEP):
         for x in range(0, IMAGE_DIM[1], STEP):
             window = centerline[y:y + STEP, x:x + STEP]
@@ -126,19 +150,21 @@ def vectorize_one_image_using_center_line(img):
                     if (lower_right[0] - upper_left[0]) <= 0 or (lower_right[1] - upper_left[1]) <= 0:
                         continue
 
-                    window = pred_img[upper_left[1]:lower_right[1], upper_left[0]:lower_right[0]]
+                    window = match_img[upper_left[1]:lower_right[1], upper_left[0]:lower_right[0]]
+                    window_pred = pred_img[upper_left[1]:lower_right[1], upper_left[0]:lower_right[0]]
                     centerline[upper_left[1]:lower_right[1], upper_left[0]:lower_right[0]] = 0
 
                     cv2.rectangle(img_with_rectangles, upper_left, lower_right, (0, 255, 0), 1)
                     cv2.rectangle(centerline_with_rect, upper_left, lower_right, (0, 255, 0), 1)
 
+                    color_average = np.average(window)
                     pixel_count = window.sum()
-                    vector[index] = [x_w, y_w, pixel_count]
+                    vector[index] = [x_w, y_w, color_average]
                     index += 1
-
                     if index >= MAX_VECTORS:
+                        vector = sort_by_distance(catheter_img, vector, pred_img)
                         return vector, img_with_rectangles, centerline_with_rect
-
+    vector = sort_by_distance(catheter_img, vector, pred_img)
     return vector, img_with_rectangles, centerline_with_rect
 
 ## Sort vectors
@@ -152,7 +178,7 @@ def most_left_upper_point(points: List[Tuple[float, float]]) -> Tuple[float, flo
             most_left_upper = point
 
     return most_left_upper
-
+    
 def calculate_angle(point1, point2, point3):
     vector1 = (point1[0] - point2[0], point1[1] - point2[1])
     vector2 = (point3[0] - point2[0], point3[1] - point2[1])
@@ -226,9 +252,15 @@ def dfs(current_point: Tuple[float, float, float], remaining_points: List[Tuple[
         
     return dfs(next_point, remaining_points, path, queue, reset_branch, previous_point, image) 
 
-def sort_by_distance(points: List[Tuple[float, float, float]], image) -> List[Tuple[float, float, float]]:
-    initial_point = most_left_upper_point(points)    
-    points = [point for point in points if not np.array_equal(point, initial_point)]
+def sort_by_distance(catheter_img, points: List[Tuple[float, float, float]], image) -> List[Tuple[float, float, float]]:
+    catheter_x, catheter_y = find_catheter_last_point(catheter_img)
+    if catheter_x!=0 and catheter_y!=0:
+        remaining_points = [point for point in points]
+        remaining_points.sort(key=lambda point: vector_distance((point[0], point[1]), (catheter_x, catheter_y)))
+        initial_point = remaining_points[0]   
+    else:
+        initial_point = most_left_upper_point(points)   
+    points = [point for point in points if not np.array_equal(point, initial_point) and not np.array_equal(point, (0,0,0))]
 
     sorted_points = dfs(initial_point, points, [], [], initial_point, [0,0], image)
     return sorted_points
@@ -292,6 +324,20 @@ def calculate_overlap_percentage(x, y, window_size, box):
     return overlap_percentage
 
 ## ViT
+
+def f1_score(y_true, y_pred):
+    y_pred = tf.round(y_pred)
+    y_true = tf.round(y_true)
+    
+    tp = K.sum(K.cast(y_true * y_pred, 'float'), axis=0)
+    fp = K.sum(K.cast((1 - y_true) * y_pred, 'float'), axis=0)
+    fn = K.sum(K.cast(y_true * (1 - y_pred), 'float'), axis=0)
+    
+    precision = tp / (tp + fp + K.epsilon())
+    recall = tp / (tp + fn + K.epsilon())
+    
+    f1 = 2 * (precision * recall) / (precision + recall + K.epsilon())
+    return K.mean(f1)
 
 def smooth_labels(labels, factor=0.1):
     labels = tf.convert_to_tensor(labels, dtype=tf.float32)
@@ -392,9 +438,51 @@ class TwoWayLoss(tf.keras.losses.Loss):
         return loss
 
 def get_criterion():
-    return TwoWayLoss(Tp=1.0, Tn=1.0)
+    return TwoWayLoss(Tp=4.0, Tn=2.0)
+
+def weighted_cross_entropy(y_true, y_pred):
+    weights = tf.constant(1.5)  # Example weight, adjust as needed
+    loss = tf.nn.weighted_cross_entropy_with_logits(labels=y_true, logits=y_pred, pos_weight=weights)
+    return tf.reduce_mean(loss)
+
+def process_batch(batch_images, batch_labels):
+        N = len(batch_images)
+        patches = tf.reshape(batch_images, (N, num_patches, patch_size * patch_size * channels))
+        # batch_labels = smooth_labels(batch_labels)
+        return ENCODER_MODEL(patches), batch_labels
 
 if __name__ == '__main__':
+    # Config
+    learning_rate = 1e-3
+    weight_decay = 1e-5
+    batch_size = 2**5
+    num_epochs = 50
+    patch_size = WINDOW_SIZE
+    num_patches = MAX_VECTORS
+    channels = 1
+    projection_dim = 2**6
+    num_heads = 4
+    transformer_units = [
+        projection_dim * 2,
+        projection_dim
+    ] 
+
+    transformer_layers = 8
+    mlp_head_units = [
+        2 ** 11,
+        2 ** 10,
+    ] 
+
+    transformer_units = [
+        projection_dim * 2,
+        projection_dim
+    ]
+
+    encoder = PatchEncoder(num_patches=num_patches, projection_dim=projection_dim)
+    ENCODER_MODEL = tf.keras.Sequential([encoder])
+    ENCODER_MODEL.save('patch_encoder.keras')
+    # ENCODER_MODEL.load_weights('patch_encoder.keras')
+
     ## Training phase
     df_train = pd.read_csv('train_labels.csv')
     df_train = df_train.apply(adjust_boxes, axis=1)
@@ -406,7 +494,7 @@ if __name__ == '__main__':
     labels = np.zeros((len(filenames), MAX_VECTORS))
     boxes = df_train[['xmin', 'ymin', 'xmax', 'ymax']].values
 
-
+    # os.makedirs("processed_data", exist_ok=True)
     # for index, filename in tqdm(enumerate(filenames)):
     #     img = cv2.imread(os.path.join("data", filename), 0)
     #     pred_img, match_img = remove_catheter(img)
@@ -439,8 +527,6 @@ if __name__ == '__main__':
     # np.save("processed_data/vector.npy", vectors)
     # np.save("processed_data/images_list.npy", images_list)
 
-    
-
     ### Remove images cannot extract vessels
     chosen_index = []
     labels = np.load("processed_data/label.npy")
@@ -453,51 +539,15 @@ if __name__ == '__main__':
     labels = labels[chosen_index]
     images_list = np.load("processed_data/images_list.npy")
     images_list = images_list[chosen_index]
-    print("N = ", len(images_list))
 
+    ### Prepare train dataset
+    dataset = tf.data.Dataset.from_tensor_slices((images_list, labels))
+    dataset = dataset.shuffle(buffer_size=len(images_list))
+    dataset = dataset.batch(batch_size)
+    dataset = dataset.map(process_batch, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+    dataset = dataset.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
 
-    ### Model config
-    learning_rate = 1e-4
-    weight_decay = 0.1
-    batch_size = 2**5
-    num_epochs = 50
-    patch_size = WINDOW_SIZE
-    num_patches = MAX_VECTORS
-    projection_dim = 2**8
-    num_heads = 8
-    transformer_units = [
-        projection_dim * 2,
-        projection_dim
-    ] 
-
-    transformer_layers = 8
-    mlp_head_units = [
-        2 ** 11,
-        2 ** 10,
-    ] 
-    N = len(images_list)
-    channels = 1
-
-
-    patches = images_list
-    patches = tf.reshape(patches, (N, num_patches, patch_size * patch_size * channels))
-    encoder = PatchEncoder(num_patches=num_patches, projection_dim=projection_dim)
-    encoder_model = tf.keras.Sequential([encoder])
-    encoder_model.save('patch_encoder.keras')
-    # encoder_model.load_weights('patch_encoder.keras')
-    encoded_patches = encoder_model(patches)
-    print(encoded_patches.shape)
-
-
-
-    # labels = smooth_labels(labels)
-
-    train_size = len(images_list)
-    transformer_units = [
-        projection_dim * 2,
-        projection_dim
-    ]
-
+    ### Train model
     optimizer = keras.optimizers.AdamW(
         learning_rate=learning_rate, weight_decay=weight_decay
     )
@@ -506,9 +556,9 @@ if __name__ == '__main__':
     stenosis_model = create_vit_classifier(input_shape, MAX_VECTORS)
     stenosis_model.compile(
         optimizer=optimizer,
-        loss=get_criterion(),
+        loss=weighted_cross_entropy,
         metrics=[
-            multi_label_accuracy,
+            f1_score,
         ],
     )
 
@@ -516,12 +566,12 @@ if __name__ == '__main__':
     checkpoint_filepath = "ViT_weights/" + str(weight_filename)
     checkpoint_callback = keras.callbacks.ModelCheckpoint(
         checkpoint_filepath,
-        monitor="multi_label_accuracy",
+        monitor="f1_score",
         save_best_only=True,
         save_weights_only=True,
     )
     f1_early_stopping_callback = keras.callbacks.EarlyStopping(
-        monitor='multi_label_accuracy',
+        monitor='f1_score',
         patience=10,
         mode='max',
         restore_best_weights=True,
@@ -529,8 +579,7 @@ if __name__ == '__main__':
     )
 
     history = stenosis_model.fit(
-        encoded_patches,
-        labels,
+        dataset,
         batch_size=batch_size,
         epochs=num_epochs,
         callbacks=[checkpoint_callback,
@@ -571,13 +620,12 @@ if __name__ == '__main__':
     #         xmax = x+WINDOW_SIZE//2
     #         ymin = y-WINDOW_SIZE//2
     #         ymax = y+WINDOW_SIZE//2
-    #         small_image = pred_img[ymin:ymax, xmin:xmax]
+    #         small_image = match_img[ymin:ymax, xmin:xmax]
     #         if small_image.shape[0]==20 and small_image.shape[1]==20:
     #             filtered_vector[count] = v
     #             images[count] = small_image
     #             label[count] = int(calculate_overlap_percentage(x, y, WINDOW_SIZE//2, boxes[index])>=50)
     #             count+=1
-
     #     vectors[index] = filtered_vector
     #     labels[index] = label
     #     images_list[index] = images
@@ -598,9 +646,14 @@ if __name__ == '__main__':
     images_list = np.load("processed_data/test_images_list.npy")
     images_list = images_list[chosen_index]
 
-    patches = images_list
-    channels = 1
-    patches = tf.reshape(patches, (len(images_list), num_patches, patch_size * patch_size * channels))
-    encoded_patches = encoder_model(patches)
-    pred = stenosis_model.predict(encoded_patches, verbose=0)
-    print(multi_label_accuracy(labels, pred))
+     ### Prepare test dataset
+    dataset = tf.data.Dataset.from_tensor_slices((images_list, labels))
+    dataset = dataset.shuffle(buffer_size=len(images_list))
+    dataset = dataset.batch(batch_size)
+    dataset = dataset.map(process_batch, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+    dataset = dataset.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
+
+    pred = stenosis_model.predict(dataset, verbose=0)
+    print(labels.shape)
+    print(pred.shape)
+    print(f1_score(labels, pred))
